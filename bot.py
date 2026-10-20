@@ -10,11 +10,13 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -24,24 +26,30 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, KeyboardButton,
-    Message, ReplyKeyboardMarkup,
+    LinkPreviewOptions, Message, ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ============================ SOZLAMALAR ============================
 # MUHIM: eski token ochiq qolgan. BotFather orqali yangi token oling (Revoke)
 # va uni shu yerga yozing yoki BOT_TOKEN muhit o'zgaruvchisiga qo'ying.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8962252644:AAGqrY9wxXomuSru9lMwX0X5sv7685gvuAA")
+# Render: Environment bo'limida BOT_TOKEN o'zgaruvchisini yarating (tirnoqsiz, bo'sh joysiz).
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip("\"'").strip()
 ADMIN_IDS = [8578660273]                 # admin Telegram ID lari
 ADMIN_USERNAME = "Kar1mov_ww"  # @ belgisiz
 BANNER = ""                             # obuna banneri: rasm yo'li yoki file_id (ixtiyoriy)
-CHECK_EVERY = 0                     # OLX ni necha soniyada tekshirish
+CHECK_EVERY = 20                        # OLX ni necha soniyada tekshirish
 MAX_FILTERS = 5                         # bitta foydalanuvchiga maksimal filtr
 SUB_DAYS = 30
 TZ = ZoneInfo("Asia/Tashkent")
 
 # ---------- KANAL SOZLAMALARI ----------
-CHANNEL_ID = "-1003971209258"          # yoki -1001234567890 (kanal ID). Bot kanalda admin bo'lishi shart
+# Render Environment: CHANNEL_ID=@kanal_username yoki -1001234567890. Bot kanalda admin bo'lishi shart
+_ch = os.getenv("CHANNEL_ID", "@kanal_username").strip().strip("\"'").strip()
+CHANNEL_ID = int(_ch) if _ch.lstrip("-").isdigit() else _ch
+# Baza fayli. Render'da Persistent Disk ni /data ga ulang, shunda ma'lumotlar o'chmaydi.
+DB_PATH = os.getenv("DB_PATH") or ("/data/bot.db" if os.path.isdir("/data") else "bot.db")
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 CHANNEL_ENABLED = True                  # False qilsangiz kanalga yuborish o'chadi
 CHANNEL_QUERIES = ["iphone", "айфон"]   # OLX da qaysi so'zlar bo'yicha qidirish
 # Faqat YANGI e'lonlar: e'lon qo'yilganiga necha daqiqadan oshmagan bo'lsa yuboriladi.
@@ -308,7 +316,7 @@ def B(*keys):
 
 
 # ============================ BAZA ============================
-db = sqlite3.connect("bot.db", check_same_thread=False)
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS users(
@@ -745,7 +753,7 @@ async def sub_btn(m: Message, state: FSMContext):
     if BANNER:
         photo = FSInputFile(BANNER) if os.path.exists(BANNER) else BANNER
         await m.answer_photo(photo)
-    await m.answer(text, reply_markup=sub_kb(lang), disable_web_page_preview=True)
+    await m.answer(text, reply_markup=sub_kb(lang), link_preview_options=NO_PREVIEW)
 
 
 @r.callback_query(F.data == "sub:rules")
@@ -982,7 +990,7 @@ async def fav_btn(m: Message, state: FSMContext):
     await state.clear()
     u, _ = ensure_user(m.from_user)
     text, kb = render_favs(u["id"], u["lang"])
-    await m.answer(text, reply_markup=kb, disable_web_page_preview=True)
+    await m.answer(text, reply_markup=kb, link_preview_options=NO_PREVIEW)
 
 
 @r.callback_query(F.data.startswith("fd:"))
@@ -990,7 +998,7 @@ async def fav_del(c: CallbackQuery):
     u = get_user(c.from_user.id)
     q("DELETE FROM favorites WHERE user_id=? AND offer_id=?", u["id"], int(c.data.split(":")[1]))
     text, kb = render_favs(u["id"], u["lang"])
-    await c.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await c.message.edit_text(text, reply_markup=kb, link_preview_options=NO_PREVIEW)
     await c.answer(t(u["lang"], "fav_removed"))
 
 
@@ -1098,16 +1106,50 @@ async def emoji_id_helper(m: Message):
 
 
 # ============================ ISHGA TUSHIRISH ============================
+async def start_web():
+    """Render Web Service port kutadi. PORT bo'lsa kichik health-server ishga tushadi."""
+    port = os.getenv("PORT")
+    if not port:
+        return None
+
+    async def ok(_):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    log.info("Health server port %s da ishlayapti", port)
+    return runner
+
+
 async def main():
+    if not re.fullmatch(r"\d{6,}:[A-Za-z0-9_-]{30,}", BOT_TOKEN):
+        log.error("BOT_TOKEN noto'g'ri yoki bo'sh. Render > Environment ga BotFather tokenini "
+                  "tirnoqsiz va bo'sh joysiz yozing.")
+        sys.exit(1)
+
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(r)
-    asyncio.create_task(poller())
-    asyncio.create_task(deliverer(bot))
+
+    web_runner = await start_web()
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    tasks = [asyncio.create_task(poller()), asyncio.create_task(deliverer(bot))]
     if CHANNEL_ENABLED:
-        asyncio.create_task(channel_poster(bot))
-    log.info("Bot ishga tushdi")
-    await dp.start_polling(bot)
+        tasks.append(asyncio.create_task(channel_poster(bot)))
+    log.info("Bot ishga tushdi. DB: %s", DB_PATH)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for task in tasks:
+            task.cancel()
+        if web_runner:
+            await web_runner.cleanup()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
