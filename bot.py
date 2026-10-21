@@ -2,6 +2,11 @@
 OLX iPhone Monitor - professional Telegram bot
 O'rnatish:  pip install "aiogram>=3.7" aiohttp
 Ishga tushirish:  python olx_iphone_pro_bot.py
+
+Render uchun environment variable'lar:
+    BOT_TOKEN   (majburiy)
+    PORT        (Render o'zi beradi)
+    DB_PATH     (ixtiyoriy, masalan /data/bot.db - doimiy disk bo'lsa)
 """
 import asyncio
 import html
@@ -15,21 +20,27 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import Command, CommandStart, ExceptionTypeFilter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, FSInputFile, InlineKeyboardButton, KeyboardButton,
+    CallbackQuery, ErrorEvent, FSInputFile, InlineKeyboardButton, KeyboardButton,
     Message, ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ============================ SOZLAMALAR ============================
-BOT_TOKEN = "8962252644:AAGqrY9wxXomuSru9lMwX0X5sv7685gvuAA"
+# DIQQAT: token kodda saqlanmaydi! Render -> Environment -> BOT_TOKEN
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+PORT = int(os.environ.get("PORT", 10000))
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
+
 ADMIN_IDS = [8578660273]                 # admin Telegram ID lari
 ADMIN_USERNAME = "Kar1mov_ww"  # @ belgisiz
 BANNER = ""                             # obuna banneri: rasm yo'li yoki file_id (ixtiyoriy)
@@ -74,7 +85,13 @@ EMOJI = {
 # ===============================================================
 
 OLX_API = "https://www.olx.uz/api/v1/offers/"
-HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Accept-Language": "uz"}
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/json",
+    "Accept-Language": "uz,ru;q=0.9,en;q=0.8",
+    "Referer": "https://www.olx.uz/",
+}
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("olxbot")
@@ -290,7 +307,7 @@ def B(*keys):
 
 
 # ============================ BAZA ============================
-db = sqlite3.connect("bot.db", check_same_thread=False)
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS users(
@@ -502,21 +519,38 @@ async def send_offer(bot, u, o):
     caption = build_caption(o, lang)
     kb = offer_kb(o, lang)
     ph = photos(o)
-    try:
+    for attempt in range(2):
         try:
-            if ph:
-                await bot.send_photo(u["id"], ph[0], caption=caption, reply_markup=kb)
-            else:
-                raise ValueError("no photo")
-        except Exception:
-            await bot.send_message(u["id"], caption, reply_markup=kb)
-        q("UPDATE users SET sent=sent+1 WHERE id=?", u["id"])
-    except Exception as e:
-        log.warning("send fail %s: %s", u["id"], e)
+            try:
+                if ph:
+                    await bot.send_photo(u["id"], ph[0], caption=caption, reply_markup=kb)
+                else:
+                    raise ValueError("no photo")
+            except (TelegramForbiddenError, TelegramRetryAfter):
+                raise
+            except Exception:
+                await bot.send_message(u["id"], caption, reply_markup=kb)
+            q("UPDATE users SET sent=sent+1 WHERE id=?", u["id"])
+            return
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramForbiddenError:
+            # foydalanuvchi botni bloklagan: unga yuborishni to'xtatamiz
+            q("UPDATE users SET paused=1 WHERE id=?", u["id"])
+            log.info("user %s botni bloklagan, pauza qilindi", u["id"])
+            return
+        except Exception as e:
+            log.warning("send fail %s: %s", u["id"], e)
+            return
 
 
 # ============================ FONDAGI JARAYONLAR ============================
+class Blocked(Exception):
+    pass
+
+
 async def poller():
+    backoff = 0   # daqiqa
     async with aiohttp.ClientSession(headers=HEADERS) as s:
         while True:
             try:
@@ -529,12 +563,17 @@ async def poller():
                             params={"offset": 0, "limit": 40, "query": query,
                                     "sort_by": "created_at:desc"},
                             timeout=aiohttp.ClientTimeout(total=30),
-                        ) as r:
-                            r.raise_for_status()
-                            data = (await r.json()).get("data", [])
+                        ) as resp:
+                            if resp.status in (403, 429):
+                                raise Blocked(resp.status)
+                            resp.raise_for_status()
+                            data = (await resp.json(content_type=None)).get("data", [])
+                    except Blocked:
+                        raise
                     except Exception as e:
                         log.warning("OLX xato (%s): %s", query, e)
                         continue
+                    backoff = 0
                     boot = not q("SELECT 1 FROM queries WHERE query=?", query)
                     if boot:
                         q("INSERT INTO queries VALUES(?)", query)
@@ -543,9 +582,15 @@ async def poller():
                         # yangi so'z birinchi marta qidirilganda eski e'lonlar "eski" deb belgilanadi
                         q("INSERT OR IGNORE INTO offers VALUES(?,?,?)",
                           o["id"], json.dumps(o, ensure_ascii=False), 0 if boot else now)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
                 q("DELETE FROM offers WHERE first_seen>0 AND first_seen<?",
                   int(time.time()) - 30 * 86400)
+            except Blocked as e:
+                # OLX blokladi: kutish 1, 2, 4, 8 ... 30 daqiqagacha oshadi
+                backoff = min(max(backoff * 2, 1), 30)
+                log.warning("OLX blokladi (HTTP %s). %s daqiqa kutamiz", e, backoff)
+                await asyncio.sleep(backoff * 60)
+                continue
             except Exception as e:
                 log.exception("poller: %s", e)
             await asyncio.sleep(CHECK_EVERY)
@@ -588,6 +633,21 @@ async def deliverer(bot):
         await asyncio.sleep(3)
 
 
+# ============================ RENDER UCHUN HTTP SERVER ============================
+async def health(_request):
+    return web.Response(text="ok")
+
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    log.info("HTTP server %s portda ishga tushdi", PORT)
+
+
 # ============================ HANDLERLAR ============================
 r = Router()
 
@@ -600,6 +660,20 @@ class NF(StatesGroup):
     region = State()
 
 
+async def on_blocked(event: ErrorEvent):
+    """Foydalanuvchi botni bloklagan bo'lsa - xatoni jim yutamiz."""
+    upd = event.update
+    uid = None
+    if upd.message:
+        uid = upd.message.from_user.id
+    elif upd.callback_query:
+        uid = upd.callback_query.from_user.id
+    if uid:
+        q("UPDATE users SET paused=1 WHERE id=?", uid)
+        log.info("user %s botni bloklagan", uid)
+    return True
+
+
 async def to_menu(m: Message, lang, text):
     u = get_user(m.chat.id)
     await m.answer(text, reply_markup=main_kb(lang, bool(u and u["paused"])))
@@ -609,6 +683,10 @@ async def to_menu(m: Message, lang, text):
 async def start(m: Message, state: FSMContext):
     await state.clear()
     u, is_new = ensure_user(m.from_user)
+    if u["paused"] and not is_new:
+        # botni qayta ishga tushirgan (avval bloklagan bo'lishi mumkin)
+        q("UPDATE users SET paused=0 WHERE id=?", u["id"])
+        u = get_user(u["id"])
     if is_new:
         await m.answer(t("uz", "pick_lang"), reply_markup=lang_kb())
     else:
@@ -705,15 +783,18 @@ async def admin_decide(c: CallbackQuery, bot: Bot):
     u = get_user(uid)
     if not u:
         return await c.answer("Foydalanuvchi topilmadi", show_alert=True)
-    if parts[1] == "ok":
-        plan = parts[3]
-        exp = activate(uid, plan, SUB_DAYS)
-        await bot.send_message(uid, t(u["lang"], "approved", plan=t(u["lang"], "pn_" + plan),
-                                      days=SUB_DAYS, date=fmt_date(exp)))
-        await c.message.edit_text(c.message.html_text + "\n\n✅ Tasdiqlandi")
-    else:
-        await bot.send_message(uid, t(u["lang"], "rejected"))
-        await c.message.edit_text(c.message.html_text + "\n\n❌ Rad etildi")
+    try:
+        if parts[1] == "ok":
+            plan = parts[3]
+            exp = activate(uid, plan, SUB_DAYS)
+            await bot.send_message(uid, t(u["lang"], "approved", plan=t(u["lang"], "pn_" + plan),
+                                          days=SUB_DAYS, date=fmt_date(exp)))
+            await c.message.edit_text(c.message.html_text + "\n\n✅ Tasdiqlandi")
+        else:
+            await bot.send_message(uid, t(u["lang"], "rejected"))
+            await c.message.edit_text(c.message.html_text + "\n\n❌ Rad etildi")
+    except TelegramForbiddenError:
+        await c.message.edit_text(c.message.html_text + "\n\n⚠️ Foydalanuvchi botni bloklagan")
     await c.answer()
 
 
@@ -937,8 +1018,11 @@ async def cmd_grant(m: Message, bot: Bot):
         return await m.answer("Foydalanish: /grant user_id p0|p1|p3 kun")
     exp = activate(uid, plan, days)
     u = get_user(uid)
-    await bot.send_message(uid, t(u["lang"], "approved", plan=t(u["lang"], "pn_" + plan),
-                                  days=days, date=fmt_date(exp)))
+    try:
+        await bot.send_message(uid, t(u["lang"], "approved", plan=t(u["lang"], "pn_" + plan),
+                                      days=days, date=fmt_date(exp)))
+    except TelegramForbiddenError:
+        await m.answer("⚠️ Foydalanuvchi botni bloklagan, xabar yetmadi.")
     await m.answer(f"✅ {uid} → {plan}, {days} kun, {fmt_date(exp)} gacha")
 
 
@@ -955,7 +1039,10 @@ async def cmd_trial(m: Message, bot: Bot):
         return await m.answer("Bu foydalanuvchi sinovdan foydalangan.")
     activate(uid, "p0", 1)
     q("UPDATE users SET trial_used=1 WHERE id=?", uid)
-    await bot.send_message(uid, t(u["lang"], "trial_on"))
+    try:
+        await bot.send_message(uid, t(u["lang"], "trial_on"))
+    except TelegramForbiddenError:
+        await m.answer("⚠️ Foydalanuvchi botni bloklagan, xabar yetmadi.")
     await m.answer(f"🎁 {uid} ga 1 kunlik sinov ochildi.")
 
 
@@ -994,14 +1081,20 @@ async def emoji_id_helper(m: Message):
 
 # ============================ ISHGA TUSHIRISH ============================
 async def main():
+    await start_web()   # Render port topishi uchun
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(r)
-    asyncio.create_task(poller())
-    asyncio.create_task(deliverer(bot))
+    dp.errors.register(on_blocked, ExceptionTypeFilter(TelegramForbiddenError))
+    tasks = [asyncio.create_task(poller()), asyncio.create_task(deliverer(bot))]
     log.info("Bot ishga tushdi")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        for tk in tasks:
+            tk.cancel()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())
