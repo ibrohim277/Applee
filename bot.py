@@ -1,5 +1,5 @@
 """
-OLX iPhone Monitor - professional Telegram bot (+ kanalga avtomatik yuborish)
+OLX iPhone Monitor - professional Telegram bot
 O'rnatish:  pip install "aiogram>=3.7" aiohttp
 Ishga tushirish:  python olx_iphone_pro_bot.py
 """
@@ -10,13 +10,11 @@ import logging
 import os
 import re
 import sqlite3
-import sys
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -26,15 +24,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, KeyboardButton,
-    LinkPreviewOptions, Message, ReplyKeyboardMarkup,
+    Message, ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ============================ SOZLAMALAR ============================
-# MUHIM: eski token ochiq qolgan. BotFather orqali yangi token oling (Revoke)
-# va uni shu yerga yozing yoki BOT_TOKEN muhit o'zgaruvchisiga qo'ying.
-# Render: Environment bo'limida BOT_TOKEN o'zgaruvchisini yarating (tirnoqsiz, bo'sh joysiz).
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip("\"'").strip()
+BOT_TOKEN = "8962252644:AAGqrY9wxXomuSru9lMwX0X5sv7685gvuAA"
 ADMIN_IDS = [8578660273]                 # admin Telegram ID lari
 ADMIN_USERNAME = "Kar1mov_ww"  # @ belgisiz
 BANNER = ""                             # obuna banneri: rasm yo'li yoki file_id (ixtiyoriy)
@@ -42,27 +37,6 @@ CHECK_EVERY = 20                        # OLX ni necha soniyada tekshirish
 MAX_FILTERS = 5                         # bitta foydalanuvchiga maksimal filtr
 SUB_DAYS = 30
 TZ = ZoneInfo("Asia/Tashkent")
-
-# ---------- KANAL SOZLAMALARI ----------
-# Render Environment: CHANNEL_ID=@kanal_username yoki -1001234567890. Bot kanalda admin bo'lishi shart
-_ch = os.getenv("CHANNEL_ID", "@kanal_username").strip().strip("\"'").strip()
-CHANNEL_ID = int(_ch) if _ch.lstrip("-").isdigit() else _ch
-# Baza fayli. Render'da Persistent Disk ni /data ga ulang, shunda ma'lumotlar o'chmaydi.
-DB_PATH = os.getenv("DB_PATH") or ("/data/bot.db" if os.path.isdir("/data") else "bot.db")
-NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
-CHANNEL_ENABLED = True                  # False qilsangiz kanalga yuborish o'chadi
-CHANNEL_QUERIES = ["iphone", "айфон"]   # OLX da qaysi so'zlar bo'yicha qidirish
-# Faqat YANGI e'lonlar: e'lon qo'yilganiga necha daqiqadan oshmagan bo'lsa yuboriladi.
-# OLX moderatsiyasi 5-10 daqiqa oladi, shuning uchun 30 daqiqa xavfsiz chegara.
-CHANNEL_MAX_AGE_MIN = 30
-# Sara e'lonlar uchun qo'shimcha shartlar (kerak bo'lmasa False / 0 qiling):
-CHANNEL_REQUIRE_PHOTO = True            # rasmi bor e'lonlar
-CHANNEL_REQUIRE_PRICE = True            # narxi ko'rsatilgan e'lonlar
-CHANNEL_MIN_PRICE = {"UZS": 1_000_000, "USD": 80}   # bundan arzon bo'lsa (aksessuar/aldov) o'tkazilmaydi
-# Faqat shu hududdagi e'lonlar (manzilda shu so'zlardan biri bo'lsa o'tadi). Bo'sh [] = butun O'zbekiston.
-CHANNEL_REGIONS = ["toshkent", "ташкент", "tashkent"]
-# Toshkent viloyatini olib tashlamoqchi bo'lsangiz (faqat shahar): ["viloyat", "область"]
-CHANNEL_REGION_EXCLUDE = []
 
 # Tariflar: delay - soniyada kechikish, price - so'm
 PLANS = {
@@ -316,7 +290,7 @@ def B(*keys):
 
 
 # ============================ BAZA ============================
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db = sqlite3.connect("bot.db", check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS users(
@@ -335,7 +309,6 @@ CREATE TABLE IF NOT EXISTS favorites(
     user_id INTEGER, offer_id INTEGER, title TEXT, url TEXT, price TEXT,
     PRIMARY KEY(user_id, offer_id));
 CREATE TABLE IF NOT EXISTS queries(query TEXT PRIMARY KEY);
-CREATE TABLE IF NOT EXISTS channel_sent(offer_id INTEGER PRIMARY KEY);
 """)
 db.commit()
 
@@ -549,8 +522,6 @@ async def poller():
             try:
                 queries = {r["query"].lower() for r in
                            q("SELECT DISTINCT query FROM filters WHERE active=1")}
-                if CHANNEL_ENABLED:
-                    queries |= {x.lower() for x in CHANNEL_QUERIES}
                 for query in queries:
                     try:
                         async with s.get(
@@ -617,88 +588,6 @@ async def deliverer(bot):
         await asyncio.sleep(3)
 
 
-# ============================ KANALGA YUBORISH ============================
-def offer_age_min(o):
-    """E'lon qo'yilganiga necha daqiqa bo'lganini qaytaradi (bilib bo'lmasa None)."""
-    raw = o.get("created_time")
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        return (time.time() - dt.timestamp()) / 60
-    except Exception:
-        return None
-
-
-def is_phone_offer(o):
-    """Faqat yangi va sara iPhone e'lonlarini o'tkazadi."""
-    title = o.get("title", "").lower()
-    text = title + " " + (o.get("description") or "").lower()
-    if not any(k in text for k in ("iphone", "айфон", "ayfon")):
-        return False
-
-    # 1) faqat yangi e'lon (eski yoki yangilab qo'yilganlar o'tmaydi)
-    age = offer_age_min(o)
-    if age is None or age > CHANNEL_MAX_AGE_MIN:
-        return False
-
-    # 2) hudud (faqat Toshkent)
-    addr = address(o).lower()
-    if CHANNEL_REGIONS and not any(x in addr for x in CHANNEL_REGIONS):
-        return False
-    if any(x in addr for x in CHANNEL_REGION_EXCLUDE):
-        return False
-
-    # 3) sifat shartlari
-    if CHANNEL_REQUIRE_PHOTO and not photos(o):
-        return False
-    val, cur, _ = parse_price(o)
-    if CHANNEL_REQUIRE_PRICE and val is None:
-        return False
-    if val is not None and val < CHANNEL_MIN_PRICE.get(cur, 0):
-        return False
-    return True
-
-
-async def channel_poster(bot):
-    """OLX dagi har bir yangi iPhone e'lonini kanalga yuboradi."""
-    while True:
-        try:
-            now = int(time.time())
-            rows = q(
-                "SELECT * FROM offers WHERE first_seen>? "
-                "AND id NOT IN (SELECT offer_id FROM channel_sent) "
-                "ORDER BY first_seen LIMIT 10",
-                now - 3600)
-            for row in rows:
-                q("INSERT OR IGNORE INTO channel_sent VALUES(?)", row["id"])
-                o = json.loads(row["data"])
-                if not is_phone_offer(o):
-                    continue
-                caption = build_caption(o, "uz")
-                kb = InlineKeyboardBuilder()
-                kb.row(InlineKeyboardButton(text="🔗 OLX'da ochish", url=o.get("url")))
-                ph = photos(o)
-                try:
-                    if ph:
-                        await bot.send_photo(CHANNEL_ID, ph[0], caption=caption,
-                                             reply_markup=kb.as_markup())
-                    else:
-                        raise ValueError("no photo")
-                except Exception:
-                    try:
-                        await bot.send_message(CHANNEL_ID, caption,
-                                               reply_markup=kb.as_markup())
-                    except Exception as e:
-                        log.warning("channel send fail: %s", e)
-                await asyncio.sleep(3)   # Telegram limitiga tushmaslik uchun
-        except Exception as e:
-            log.exception("channel_poster: %s", e)
-        await asyncio.sleep(5)
-
-
 # ============================ HANDLERLAR ============================
 r = Router()
 
@@ -753,7 +642,7 @@ async def sub_btn(m: Message, state: FSMContext):
     if BANNER:
         photo = FSInputFile(BANNER) if os.path.exists(BANNER) else BANNER
         await m.answer_photo(photo)
-    await m.answer(text, reply_markup=sub_kb(lang), link_preview_options=NO_PREVIEW)
+    await m.answer(text, reply_markup=sub_kb(lang), disable_web_page_preview=True)
 
 
 @r.callback_query(F.data == "sub:rules")
@@ -990,7 +879,7 @@ async def fav_btn(m: Message, state: FSMContext):
     await state.clear()
     u, _ = ensure_user(m.from_user)
     text, kb = render_favs(u["id"], u["lang"])
-    await m.answer(text, reply_markup=kb, link_preview_options=NO_PREVIEW)
+    await m.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 @r.callback_query(F.data.startswith("fd:"))
@@ -998,7 +887,7 @@ async def fav_del(c: CallbackQuery):
     u = get_user(c.from_user.id)
     q("DELETE FROM favorites WHERE user_id=? AND offer_id=?", u["id"], int(c.data.split(":")[1]))
     text, kb = render_favs(u["id"], u["lang"])
-    await c.message.edit_text(text, reply_markup=kb, link_preview_options=NO_PREVIEW)
+    await c.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
     await c.answer(t(u["lang"], "fav_removed"))
 
 
@@ -1076,9 +965,7 @@ async def cmd_astats(m: Message):
     total = q("SELECT COUNT(*) AS n FROM users")[0]["n"]
     act = q("SELECT COUNT(*) AS n FROM users WHERE plan IS NOT NULL AND expires>?", now)[0]["n"]
     sent = q("SELECT COALESCE(SUM(sent),0) AS n FROM users")[0]["n"]
-    ch = q("SELECT COUNT(*) AS n FROM channel_sent")[0]["n"]
-    await m.answer(f"👥 Jami: {total}\n💎 Obunali: {act}\n📨 Yuborilgan e'lonlar: {sent}\n"
-                   f"📢 Kanal uchun ko'rilgan e'lonlar: {ch}")
+    await m.answer(f"👥 Jami: {total}\n💎 Obunali: {act}\n📨 Yuborilgan e'lonlar: {sent}")
 
 
 @r.message(Command("broadcast"), F.from_user.id.in_(ADMIN_IDS))
@@ -1106,51 +993,15 @@ async def emoji_id_helper(m: Message):
 
 
 # ============================ ISHGA TUSHIRISH ============================
-async def start_web():
-    """Render Web Service port kutadi. PORT bo'lsa kichik health-server ishga tushadi."""
-    port = os.getenv("PORT")
-    if not port:
-        return None
-
-    async def ok(_):
-        return web.Response(text="OK")
-
-    app = web.Application()
-    app.router.add_get("/", ok)
-    app.router.add_get("/health", ok)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
-    log.info("Health server port %s da ishlayapti", port)
-    return runner
-
-
 async def main():
-    if not re.fullmatch(r"\d{6,}:[A-Za-z0-9_-]{30,}", BOT_TOKEN):
-        log.error("BOT_TOKEN noto'g'ri yoki bo'sh. Render > Environment ga BotFather tokenini "
-                  "tirnoqsiz va bo'sh joysiz yozing.")
-        sys.exit(1)
-
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(r)
-
-    web_runner = await start_web()
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    tasks = [asyncio.create_task(poller()), asyncio.create_task(deliverer(bot))]
-    if CHANNEL_ENABLED:
-        tasks.append(asyncio.create_task(channel_poster(bot)))
-    log.info("Bot ishga tushdi. DB: %s", DB_PATH)
-    try:
-        await dp.start_polling(bot)
-    finally:
-        for task in tasks:
-            task.cancel()
-        if web_runner:
-            await web_runner.cleanup()
-        await bot.session.close()
+    asyncio.create_task(poller())
+    asyncio.create_task(deliverer(bot))
+    log.info("Bot ishga tushdi")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main()) 
