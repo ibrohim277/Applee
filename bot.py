@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -571,6 +572,10 @@ async def poller():
                             timeout=aiohttp.ClientTimeout(total=30),
                             proxy=PROXY_URL,
                         ) as r:
+                            if r.status == 403:
+                                body = (await r.text())[:150].replace("\n", " ")
+                                log.warning("403 tafsilot: server=%s cf-ray=%s javob=%s",
+                                            r.headers.get("Server"), r.headers.get("CF-RAY"), body)
                             r.raise_for_status()
                             data = (await r.json()).get("data", [])
                     except Exception as e:
@@ -1159,6 +1164,14 @@ async def main():
     tasks = [asyncio.create_task(poller()), asyncio.create_task(deliverer(bot))]
     if CHANNEL_ENABLED:
         tasks.append(asyncio.create_task(channel_poster(bot)))
+    if PROXY_URL:
+        try:
+            pu = urlparse(PROXY_URL)
+            log.info("PROXY ishlatilmoqda: %s:%s (login: %s)", pu.hostname, pu.port, pu.username)
+        except Exception:
+            log.error("PROXY_URL formati noto'g'ri! To'g'ri format: http://login:parol@host:port")
+    else:
+        log.warning("PROXY_URL o'rnatilmagan, OLX ga proxy'siz kiriladi.")
     log.info("Bot ishga tushdi. DB: %s", DB_PATH)
     try:
         await dp.start_polling(bot)
